@@ -169,6 +169,8 @@ class Controller:
         # imu_state quaternion: w, x, y, z
         # quat = self.low_state.imu_state.quaternion
         quat = ypr_to_quaternion(self.low_state.imu_state.ypr[0],self.low_state.imu_state.ypr[1],self.low_state.imu_state.ypr[2])
+        quat = self.low_state.imu_state.quaternion
+        print(self.low_state.imu_state.quaternion)
         ang_vel = np.array([self.low_state.imu_state.gyroscope], dtype=np.float32)
 
         if self.config.imu_type == "torso":
@@ -191,7 +193,7 @@ class Controller:
         cos_phase = np.cos(2 * np.pi * phase)
 
         self.cmd[0] = self.remote_controller.get_walk_x_direction_speed()
-        self.cmd[1] = self.remote_controller.get_walk_y_direction_speed
+        self.cmd[1] = self.remote_controller.get_walk_y_direction_speed()
         self.cmd[2] = self.remote_controller.get_walk_yaw_direction_speed()
 
         num_actions = self.config.num_actions

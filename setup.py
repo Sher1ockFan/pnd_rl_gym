@@ -8,4 +8,4 @@ setup(name='pnd_rl_gym',
       packages=find_packages(),
       author_email='support@pndbotics.com',
       description='Template RL environments for PND Robots',
-      install_requires=['isaacgym', 'rsl-rl', 'matplotlib', 'numpy==1.20', 'tensorboard', 'mujoco==3.2.3', 'pyyaml', 'wandb'])
+      install_requires=['matplotlib', 'numpy==1.20', 'tensorboard', 'mujoco==3.2.3', 'pyyaml', 'wandb'])

@@ -32,7 +32,7 @@ class RemoteController:
 
         self.dead_area = 5000
         self.max_value = 32767
-        self.ly_dir = 1.0
+        self.ly_dir = -1.0
         self.lx_dir = 1.0
         self.rx_dir = 1.0
         self.max_speed_x = 1.0
@@ -47,8 +47,8 @@ class RemoteController:
         for i in range(10):
             self.button[i] = data [i + 8]
         self.lx = data[0]
-        self.ly = -data[1]
-        self.rx = -data[2]
+        self.ly = data[1]
+        self.rx = data[2]
         self.ry = data[3]
         self.lt = data[4]
         self.rt = data[5]
@@ -73,6 +73,11 @@ class RemoteController:
                     return self.ly_dir * self.max_speed_x * ((abs_x_value - self.dead_area) / (self.max_value - self.dead_area))
                 else:
                     return self.ly_dir * self.min_speed_x * ((abs_x_value - self.dead_area) / (self.max_value - self.dead_area))
+            
+            # sim
+            elif(abs_x_value <= 1):
+                return self.ly * self.ly_dir
+            
             else:
                 return 0.0
         else:

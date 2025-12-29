@@ -21,6 +21,9 @@ class Config:
             self.lowstate_topic = config["lowstate_topic"]
 
             self.policy_path = config["policy_path"].replace("{LEGGED_GYM_ROOT_DIR}", LEGGED_GYM_ROOT_DIR)
+            self.estimatory_path = None
+            if "estimatory_path" in config:
+                self.estimatory_path = config["estimatory_path"].replace("{LEGGED_GYM_ROOT_DIR}", LEGGED_GYM_ROOT_DIR)
 
             self.leg_joint2motor_idx = config["leg_joint2motor_idx"]
             self.kps = config["kps"]
@@ -41,3 +44,28 @@ class Config:
 
             self.num_actions = config["num_actions"]
             self.num_obs = config["num_obs"]
+
+            # Optional parameters for advanced configurations
+            self.delta_num = None
+            if "delta_num" in config:
+                self.delta_num = config["delta_num"]
+
+            self.frame_stack = None
+            if "frame_stack" in config:
+                self.frame_stack = config["frame_stack"]
+
+            self.latent_frame_stack = None
+            if "latent_frame_stack" in config:
+                self.latent_frame_stack = config["latent_frame_stack"]
+
+            self.latent_size = None
+            if "latent_size" in config:
+                self.latent_size = config["latent_size"]
+
+            self.cycle_time_stand = None
+            if "cycle_time_stand" in config:
+                self.cycle_time_stand = config["cycle_time_stand"]
+
+            self.cycle_time_walk = None
+            if "cycle_time_walk" in config:
+                self.cycle_time_walk = config["cycle_time_walk"]
