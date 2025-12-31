@@ -35,57 +35,55 @@ class Controller:
         self.num_obs = config.num_obs
         self.input_num = config.num_obs * config.frame_stack + config.latent_size
         self.est_input_num = config.num_obs * config.latent_frame_stack
-        self.delta_num = config.delta_num if config.delta_num else 0
+        self.delta_num = 0
         
         # Initialize observation buffers
-        self.obs = np.zeros(self.input_num, dtype=np.float32)
-        self.vae_obs = np.zeros(self.est_input_num, dtype=np.float32)
         self.hist_obs = np.zeros(self.est_input_num, dtype=np.float32)
+        self.vae_obs = np.zeros(self.est_input_num, dtype=np.float32)
+        # Low pass filters
+        self.omega_filter = LowPassFilter(100, 0.707, config.control_dt, 3)
+        self.action_filter = LowPassFilter(100, 0.707, config.control_dt, 23)
+
+        self.timer_plan = 0.0
+
+        self.action_last = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
+        # Action smoothing parameters
+        self.last_action_d = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
+        self.last_action_dot_d = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
+        self.predictive_time = 0.02
+        self.para_0 = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
+        self.para_1 = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
+        self.para_2 = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
+        self.para_3 = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
+
+        self.input_data_mlp_humanoid = np.zeros(self.num_obs, dtype=np.float32)
+        self.output_data_mlp = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
         self.est_input_array = np.zeros(self.est_input_num, dtype=np.float32)
         self.input_array = np.zeros(self.input_num, dtype=np.float32)
-        self.input_data_mlp_humanoid = np.zeros(self.num_obs, dtype=np.float32)
         
         # Initializing process variables
-        self.qj = np.zeros(config.num_actions, dtype=np.float32)
-        self.dqj = np.zeros(config.num_actions, dtype=np.float32)
+        self.cur_joint_pos = np.zeros(config.num_actions, dtype=np.float32)
+        self.cur_joint_vel = np.zeros(config.num_actions, dtype=np.float32)
         self.action = np.zeros(config.num_actions, dtype=np.float32)
-        self.action_last = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
-        self.output_data_mlp = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
-        
+
+        self.gait_d = "Walk"  # "Stand" or "Walk"
+        self.gait_a = "Walk"
+
         # Command and state variables
         self.cmd = np.array([0.0, 0.0, 0.0])
-        self.joystick_command = np.array([0.0, 0.0, 0.0])
-        self.command_ori = np.array([0.0, 0.0, 0.0])
-        self.x_vel_command_offset = 0.0
-        self.y_vel_command_offset = 0.0
-        self.pos_percent = 0.0
-        self.pos_duration = 1.0
         
         # Command scales
         self.command_scales_humanoid = np.array([2.0, 2.0, 2.0])
         
         # Gait and phase variables
         self.rl_counter = 0
-        self.stand_counter = 100
-        self.phase_counter = 1
-        self.gait_d = "Walk"  # "Stand" or "Walk"
-        self.gait_a = "Walk"
+        self.phase_counter = 1  # Increment by 1 each inference step
+
         self.gait_cycle_humanoid = config.cycle_time_walk
         self.avg_yaw_vel = 0.0
+
         
-        # Low pass filters
-        self.omega_filter = LowPassFilter(100, 0.707, 0.0025, 3)
-        self.action_filter = LowPassFilter(100, 0.707, 0.0025, 23)
-        
-        # Action smoothing parameters
-        self.last_action_d = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
-        self.last_action_dot_d = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
-        self.predictive_time = 0.02
-        self.timer_plan = 0.0
-        self.para_0 = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
-        self.para_1 = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
-        self.para_2 = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
-        self.para_3 = np.zeros(config.num_actions + self.delta_num, dtype=np.float32)
+
         
         # Observation scales (from C++ code)
         self.obs_scales_dof_pos = config.dof_pos_scale
@@ -214,27 +212,56 @@ class Controller:
             
             # create observation
             self.send_cmd(self.low_cmd)
+            self.last_send_time = time.time()
             time.sleep(self.config.control_dt)
 
     def compute_obervation(self):
+        """Compute observations similar to C++ StateMLP::computeObs"""
+        # Get joint positions and velocities
+                # Fill leg joints
+        for i in range(self.config.num_actions):
+            self.cur_joint_pos[i] = self.low_state.motor_state[i].q
+            self.cur_joint_vel[i] = self.low_state.motor_state[i].dq
 
+        # Inference period: 100Hz inference from 400Hz control (every 4 control cycles)
+        inference_dt = self.config.control_dt * 4  # 0.01s for 100Hz inference
+        
+        # Compute gait phase
+        gait_phase = self.rl_counter * inference_dt / self.gait_cycle_humanoid
+        self.sin_phase = np.sin(2.0 * np.pi * gait_phase)
+        self.cos_phase = np.cos(2.0 * np.pi * gait_phase)
+        self.ang_vel = np.array([self.low_state.imu_state.gyroscope], dtype=np.float32)
+        quat = ypr_to_quaternion(self.low_state.imu_state.ypr[0],self.low_state.imu_state.ypr[1],self.low_state.imu_state.ypr[2])
+        if self.config.imu_type == "torso":
+            # imu data needs to be transformed to the pelvis frame
+            waist_yaw = self.low_state.motor_state[self.config.arm_waist_joint2motor_idx[0]].q
+            waist_yaw_omega = self.low_state.motor_state[self.config.arm_waist_joint2motor_idx[0]].dq
+            quat, self.ang_vel = transform_imu_data(waist_yaw=waist_yaw, waist_yaw_omega=waist_yaw_omega, imu_quat=quat, imu_omega=self.ang_vel)
+      
+        # Update average yaw velocity
+        self.avg_yaw_vel = (1.0 * inference_dt / self.gait_cycle_humanoid) * self.ang_vel[0][2] + \
+                          (1.0 - 1.0 * inference_dt / self.gait_cycle_humanoid) * self.avg_yaw_vel
+        quat = self.low_state.imu_state.quaternion
+        # create observation
+        self.gravity_orientation = get_gravity_orientation(quat)
         # Construct observation vector
         self.input_data_mlp_humanoid[0] = self.cmd[0] * self.command_scales_humanoid[0]
         self.input_data_mlp_humanoid[1] = self.cmd[1] * self.command_scales_humanoid[1]
         self.input_data_mlp_humanoid[2] = self.cmd[2] * self.command_scales_humanoid[2]
         self.input_data_mlp_humanoid[3:6] = self.gravity_orientation
-        self.input_data_mlp_humanoid[6:6+len(self.qj)] = (self.qj - self.config.default_angles) * self.obs_scales_dof_pos
-        self.input_data_mlp_humanoid[6+len(self.qj):6+len(self.qj)*2] = self.dqj * self.obs_scales_dof_vel
-        self.input_data_mlp_humanoid[6+len(self.qj)*2:6+len(self.qj)*3] = self.action_last[:len(self.qj)]
-        self.input_data_mlp_humanoid[6+len(self.qj)*3:6+len(self.qj)*3+3] = self.ang_vel * self.obs_scales_ang_vel
-        self.input_data_mlp_humanoid[6+len(self.qj)*3+3] = self.avg_yaw_vel * self.obs_scales_ang_vel
-        self.input_data_mlp_humanoid[6+len(self.qj)*3+4] = self.sin_phase
-        self.input_data_mlp_humanoid[6+len(self.qj)*3+5] = self.cos_phase
+        self.input_data_mlp_humanoid[6:6+self.config.num_actions] = (self.cur_joint_pos - self.config.default_angles) * self.obs_scales_dof_pos
+        self.input_data_mlp_humanoid[6+self.config.num_actions:6+self.config.num_actions*2] = self.cur_joint_vel * self.obs_scales_dof_vel
+        self.input_data_mlp_humanoid[6+self.config.num_actions*2:6+self.config.num_actions*3] = self.action_last
+        self.input_data_mlp_humanoid[6+self.config.num_actions*3:9+self.config.num_actions*3] = self.ang_vel * self.obs_scales_ang_vel
+        self.input_data_mlp_humanoid[9+self.config.num_actions*3] = self.avg_yaw_vel * self.obs_scales_ang_vel
+        self.input_data_mlp_humanoid[10+self.config.num_actions*3] = self.sin_phase
+        self.input_data_mlp_humanoid[11+self.config.num_actions*3] = self.cos_phase
         
+
         # Apply low pass filter to angular velocity
-        omega_segment = self.input_data_mlp_humanoid[6+len(self.qj)*3:6+len(self.qj)*3+3]
+        omega_segment = self.input_data_mlp_humanoid[6+self.config.num_actions*3:6+self.config.num_actions*3+3]
         filtered_omega = self.omega_filter.update(omega_segment)
-        self.input_data_mlp_humanoid[6+len(self.qj)*3:6+len(self.qj)*3+3] = filtered_omega
+        self.input_data_mlp_humanoid[6+self.config.num_actions*3:6+self.config.num_actions*3+3] = filtered_omega
         
         # Clip observation
         self.input_data_mlp_humanoid = np.clip(self.input_data_mlp_humanoid, -18.0, 18.0)
@@ -250,21 +277,28 @@ class Controller:
         self.input_array[:self.est_input_num] = self.hist_obs
 
     def compute_action(self):
-        """Compute actions using estimator and policy network (based on C++ StateMLP::computeActions)"""
         # Run estimator model
+        # 创建一个全0的input，大小与self.est_input_array相同
+        input_data_est = torch.zeros(self.est_input_array.shape, dtype=torch.float32).unsqueeze(0)
+
         if self.est_model is not None:
             input_data_est = torch.from_numpy(self.est_input_array).float().unsqueeze(0)
-            with torch.no_grad():
-                output_data_est = self.est_model(input_data_est)
+
+            # with torch.no_grad():
+            output_data_est = self.est_model(input_data_est)
 
             # Append latent to input_array
             for i in range(self.config.latent_size):
                 self.input_array[self.est_input_num + i] = output_data_est[0][i].item()
+                
         # Run policy network
+        input_data = torch.zeros(self.input_array.shape, dtype=torch.float32).unsqueeze(0)
         input_data = torch.from_numpy(self.input_array).float().unsqueeze(0)
-        with torch.no_grad():
-            output_data = self.policy(input_data)
-            out = np.array([output_data[0][i].item() for i in range(output_data.size(1))])
+
+        # with torch.no_grad():
+        output_data = self.policy(input_data)
+
+        out = np.array([output_data[0][i].item() for i in range(output_data.size(1))])
         # Process output
         kObsDof = self.config.num_actions
         for i in range(kObsDof):
@@ -273,20 +307,17 @@ class Controller:
                 self.output_data_mlp[i] = np.clip(out[i], -18.0, 18.0)
                 self.para_0 = self.last_action_d
                 self.para_1 = self.last_action_dot_d
-                self.para_2 = 3.0 * (self.output_data_mlp - self.last_action_d -
-                                    self.last_action_dot_d * self.predictive_time) / \
-                            (self.predictive_time * self.predictive_time) - \
+                self.para_2 = 3.0 * (self.output_data_mlp - self.last_action_d - self.last_action_dot_d * self.predictive_time) / \
+                            self.predictive_time / self.predictive_time - \
                             (-self.last_action_dot_d) / self.predictive_time
+
                 self.para_3 = -2.0 * (self.output_data_mlp - self.last_action_d -
                                     self.last_action_dot_d * self.predictive_time) / \
-                            (self.predictive_time * self.predictive_time * self.predictive_time) + \
-                            (-self.last_action_dot_d) / (self.predictive_time * self.predictive_time)
-            self.timer_plan = 0.0
+                            self.predictive_time / self.predictive_time / self.predictive_time + \
+                            (-self.last_action_dot_d) / self.predictive_time / self.predictive_time
+                self.timer_plan = 0.0
 
         self.rl_counter += self.phase_counter
-
-        # Compute scaled output (similar to C++ mlp_out_scaled)
-        self.mlp_out_scaled = self.output_data_mlp * self.action_scales + self.config.default_angles
             
     def run(self):
         start_time = time.time()
@@ -299,46 +330,10 @@ class Controller:
         self.cmd[0] = self.remote_controller.get_walk_x_direction_speed()
         self.cmd[1] = self.remote_controller.get_walk_y_direction_speed()
         self.cmd[2] = self.remote_controller.get_walk_yaw_direction_speed()
-        """Compute observations similar to C++ StateMLP::computeObs"""
-        # Get joint positions and velocities
-        # Fill leg joints
-        for i in range(self.config.num_actions):
-            self.qj[i] = self.low_state.motor_state[i].q
-            self.dqj[i] = self.low_state.motor_state[i].dq
-        
-        # Get IMU data
-        quat = ypr_to_quaternion(
-            self.low_state.imu_state.ypr[0],
-            self.low_state.imu_state.ypr[1],
-            self.low_state.imu_state.ypr[2]
-        )
-        # Compute rotation matrix and gravity orientation
-        self.ang_vel = np.array([self.low_state.imu_state.gyroscope], dtype=np.float32)
-        
-        # Update average yaw velocity
-        self.avg_yaw_vel = (1.0 * 0.01 / self.gait_cycle_humanoid) * self.ang_vel[0][2] + \
-                          (1.0 - 1.0 * 0.01 / self.gait_cycle_humanoid) * self.avg_yaw_vel
-        
-        # Compute gait phase
-        gait_phase = self.rl_counter * 0.01 / self.gait_cycle_humanoid
-        self.sin_phase = np.sin(2.0 * np.pi * gait_phase)
-        self.cos_phase = np.cos(2.0 * np.pi * gait_phase)
-        
-        quat = ypr_to_quaternion(self.low_state.imu_state.ypr[0],self.low_state.imu_state.ypr[1],self.low_state.imu_state.ypr[2])
-        if self.config.imu_type == "torso":
-            # imu data needs to be transformed to the pelvis frame
-            waist_yaw = self.low_state.motor_state[self.config.arm_waist_joint2motor_idx[0]].q
-            waist_yaw_omega = self.low_state.motor_state[self.config.arm_waist_joint2motor_idx[0]].dq
-            quat, self.ang_vel = transform_imu_data(waist_yaw=waist_yaw, waist_yaw_omega=waist_yaw_omega, imu_quat=quat, imu_omega=self.ang_vel)
-
-        quat = self.low_state.imu_state.quaternion
-        # create observation
-        self.gravity_orientation = get_gravity_orientation(quat)
 
         if self.counter % 4 == 0:
             self.compute_obervation()
             self.compute_action()
-
 
         self.action_last = self.output_data_mlp
         mlp_out = self.output_data_mlp
@@ -350,31 +345,33 @@ class Controller:
         
         # transform action to target_dof_pos
         self.mlp_out_scaled = mlp_out * self.action_scales + self.config.default_angles
-        target_dof_pos = self.mlp_out_scaled
+
+        self.mlp_out_scaled[5] = self.low_state.motor_state[5].q  # keep ankle motor position
+        self.mlp_out_scaled[11] = self.low_state.motor_state[11].q  # keep ankle motor position
         
         # Build low cmd
         for i in range(self.config.num_actions):
-            self.low_cmd.motor_cmd[i].q = target_dof_pos[i]
+            self.low_cmd.motor_cmd[i].q = self.mlp_out_scaled[i]
             self.low_cmd.motor_cmd[i].qd = 0
             self.low_cmd.motor_cmd[i].kp = self.config.kps[i]
             self.low_cmd.motor_cmd[i].kd = self.config.kds[i]
             self.low_cmd.motor_cmd[i].tau = 0
 
         # send the command
-        self.low_cmd.motor_cmd[5].q = self.low_state.motor_state[5].q  # keep ankle motor position
-        self.low_cmd.motor_cmd[11].q = self.low_state.motor_state[11].q  # keep ankle motor position
-        self.send_cmd(self.low_cmd)
-        for i in range(self.config.num_actions):
-            self.low_state.dq = 0
-            self.low_state.tau = 0
+
 
         self.last_action_d = mlp_out
         self.last_action_dot_d = mlp_out_dot
+
         self.counter += 1
         end_time = time.time()
         d_time = end_time - start_time
         if d_time < self.config.control_dt:
             time.sleep(self.config.control_dt - d_time)
+        self.send_cmd(self.low_cmd)
+        # print(f"send cmd time: {time.time() - self.last_send_time:.6f} s")
+        # self.last_send_time = time.time()
+        
 
 if __name__ == "__main__":
     import argparse
