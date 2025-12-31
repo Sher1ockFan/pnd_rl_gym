@@ -92,7 +92,9 @@ class Controller:
         self.action_scales = config.action_scale
         
         self.counter = 0
-       
+        self.control_dt_ns = int(self.config.control_dt * 1e9)
+        
+        self.next_tick_ns = None  # first call will init
         if config.msg_type == "adam_lite":
             self.low_cmd = pnd_adam_msg_dds__LowCmd_(23)
             self.low_state = pnd_adam_msg_dds__LowState_(23)
@@ -180,6 +182,8 @@ class Controller:
                 self.hand_pub.Write(self.hand_cmd)
 
             self.send_cmd(self.low_cmd)
+            self.last_send_time = time.time()
+
             time.sleep(self.config.control_dt)
     
 
@@ -212,7 +216,6 @@ class Controller:
             
             # create observation
             self.send_cmd(self.low_cmd)
-            self.last_send_time = time.time()
             time.sleep(self.config.control_dt)
 
     def compute_obervation(self):
@@ -320,8 +323,16 @@ class Controller:
         self.rl_counter += self.phase_counter
             
     def run(self):
-        start_time = time.time()
-        # hand publisher
+        # ---------- init tick anchor ----------
+        now_ns = time.perf_counter_ns()
+        if self.next_tick_ns is None:
+            self.next_tick_ns = now_ns + self.control_dt_ns
+
+        start_ns = now_ns
+
+        # ======================
+        # your original logic
+        # ======================
         if config.msg_type != "adam_lite":
             for i in range(12):
                 self.hand_cmd.position[i] = self.close_hand[i]
@@ -336,41 +347,56 @@ class Controller:
             self.compute_action()
 
         self.action_last = self.output_data_mlp
-        mlp_out = self.output_data_mlp
-        mlp_out_dot = np.zeros(self.config.num_actions + self.delta_num, dtype=np.float32)
+
         self.timer_plan += self.config.control_dt
-        mlp_out = self.para_0 + self.para_1 * self.timer_plan + self.para_2 * self.timer_plan * self.timer_plan + \
-                  self.para_3 * self.timer_plan * self.timer_plan * self.timer_plan
-        mlp_out_dot = self.para_1 + 2.0 * self.para_2 * self.timer_plan + 3.0 * self.para_3 * self.timer_plan * self.timer_plan
-        
-        # transform action to target_dof_pos
+        t = self.timer_plan
+
+        mlp_out = (
+            self.para_0
+            + self.para_1 * t
+            + self.para_2 * t * t
+            + self.para_3 * t * t * t
+        )
+
+        mlp_out_dot = (
+            self.para_1
+            + 2.0 * self.para_2 * t
+            + 3.0 * self.para_3 * t * t
+        )
+
         self.mlp_out_scaled = mlp_out * self.action_scales + self.config.default_angles
+        self.mlp_out_scaled[5]  = self.low_state.motor_state[5].q
+        self.mlp_out_scaled[11] = self.low_state.motor_state[11].q
 
-        self.mlp_out_scaled[5] = self.low_state.motor_state[5].q  # keep ankle motor position
-        self.mlp_out_scaled[11] = self.low_state.motor_state[11].q  # keep ankle motor position
-        
-        # Build low cmd
         for i in range(self.config.num_actions):
-            self.low_cmd.motor_cmd[i].q = self.mlp_out_scaled[i]
-            self.low_cmd.motor_cmd[i].qd = 0
-            self.low_cmd.motor_cmd[i].kp = self.config.kps[i]
-            self.low_cmd.motor_cmd[i].kd = self.config.kds[i]
-            self.low_cmd.motor_cmd[i].tau = 0
+            self.low_cmd.motor_cmd[i].q = float(self.mlp_out_scaled[i])
+            self.low_cmd.motor_cmd[i].qd = 0.0
+            self.low_cmd.motor_cmd[i].kp = float(self.config.kps[i])
+            self.low_cmd.motor_cmd[i].kd = float(self.config.kds[i])
+            self.low_cmd.motor_cmd[i].tau = 0.0
 
-        # send the command
-
+        self.send_cmd(self.low_cmd)
 
         self.last_action_d = mlp_out
         self.last_action_dot_d = mlp_out_dot
-
         self.counter += 1
-        end_time = time.time()
-        d_time = end_time - start_time
-        if d_time < self.config.control_dt:
-            time.sleep(self.config.control_dt - d_time)
-        self.send_cmd(self.low_cmd)
-        # print(f"send cmd time: {time.time() - self.last_send_time:.6f} s")
-        # self.last_send_time = time.time()
+
+        # ======================
+        # precise timing control (align to absolute schedule)
+        # ======================
+        self.next_tick_ns += self.control_dt_ns
+
+        now_ns = time.perf_counter_ns()
+        sleep_ns = self.next_tick_ns - now_ns
+
+        if sleep_ns > 0:
+            time.sleep(sleep_ns / 1e9)
+        else:
+            # overrun: reset anchor to avoid accumulating delay
+            self.next_tick_ns = now_ns + self.control_dt_ns
+
+        # optional debug
+        # print(f"tick: {(time.perf_counter_ns() - start_ns)/1e6:.3f} ms")
         
 
 if __name__ == "__main__":
