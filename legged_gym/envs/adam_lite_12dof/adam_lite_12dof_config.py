@@ -88,11 +88,11 @@ class AdamLite12dofRoughCfg(LeggedRobotCfg):
             'hipRoll': 30.0,
             'hipYaw': 6.1,
             'kneePitch': 6.1,
-            'anklePitch': 2.55,
+            'anklePitch': 5.0,
             'ankleRoll': 0.35,
         }  # [N*m*s/rad]
         # action scale: target angle = actionScale * action + defaultAngle
-        action_scale = 0.5  # 0.5 corresponds to about 30 degrees range
+        action_scale = 0.25  # 0.5 corresponds to about 30 degrees range
         # decimation: Number of control action updates @ sim DT per policy DT
         decimation = 4
 
@@ -123,12 +123,12 @@ class AdamLite12dofRoughCfg(LeggedRobotCfg):
             base_height = -3.0          # Maintain target height
             
             # Joint Control
-            dof_acc = -2.5e-7           # Penalize joint accelerations
+            dof_acc = -2.5e-6           # Penalize joint accelerations
             dof_vel = -1e-3             # Penalize high joint velocities
             dof_pos_limits = -5.0       # Penalize approaching joint limits
             hip_pos = -0.5              # Regularize hip positions
             ankle_pos = -1.0            # Keep ankles stable (fix toe-up & roll issues)
-            action_rate = -0.01         # Smooth actions (penalize rapid changes)
+            action_rate = -0.05         # Smooth actions (penalize rapid changes)
             
             # Foot Contact & Gait
             feet_air_time = 0.05        # Small value to lift feet without jumping
