@@ -22,6 +22,7 @@ class Controller:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.remote_controller = RemoteController()
+        self.device = torch.device("cpu")
 
         # Initialize the policy network
         self.policy = torch.jit.load(config.policy_path, map_location="cpu")
