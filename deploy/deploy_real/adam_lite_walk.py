@@ -83,9 +83,10 @@ class Controller:
         self.gait_cycle_humanoid = config.cycle_time_walk
         self.avg_yaw_vel = 0.0
 
-        
+        self.input_data_est_tensor = torch.zeros((1, self.est_input_array.size), dtype=torch.float32, device=self.device)
+        self.input_data_tensor = torch.zeros((1, self.input_array.size), dtype=torch.float32, device=self.device)
+        self.output_data = torch.zeros(self.config.num_actions)
 
-        
         # Observation scales (from C++ code)
         self.obs_scales_dof_pos = config.dof_pos_scale
         self.obs_scales_dof_vel = config.dof_vel_scale
@@ -228,10 +229,9 @@ class Controller:
             self.cur_joint_vel[i] = self.low_state.motor_state[i].dq
 
         # Inference period: 100Hz inference from 400Hz control (every 4 control cycles)
-        inference_dt = self.config.control_dt * 4  # 0.01s for 100Hz inference
         
         # Compute gait phase
-        gait_phase = self.rl_counter * inference_dt / self.gait_cycle_humanoid
+        gait_phase = self.rl_counter * 0.01 / self.gait_cycle_humanoid
         self.sin_phase = np.sin(2.0 * np.pi * gait_phase)
         self.cos_phase = np.cos(2.0 * np.pi * gait_phase)
         self.ang_vel = np.array([self.low_state.imu_state.gyroscope], dtype=np.float32)
@@ -243,8 +243,8 @@ class Controller:
             quat, self.ang_vel = transform_imu_data(waist_yaw=waist_yaw, waist_yaw_omega=waist_yaw_omega, imu_quat=quat, imu_omega=self.ang_vel)
       
         # Update average yaw velocity
-        self.avg_yaw_vel = (1.0 * inference_dt / self.gait_cycle_humanoid) * self.ang_vel[0][2] + \
-                          (1.0 - 1.0 * inference_dt / self.gait_cycle_humanoid) * self.avg_yaw_vel
+        self.avg_yaw_vel = (1.0 * 0.01 / self.gait_cycle_humanoid) * self.ang_vel[0][2] + \
+                          (1.0 - 1.0 * 0.01 / self.gait_cycle_humanoid) * self.avg_yaw_vel
         quat = self.low_state.imu_state.quaternion
         # create observation
         self.gravity_orientation = get_gravity_orientation(quat)
@@ -282,10 +282,6 @@ class Controller:
 
     def compute_action(self):
         # Run estimator model
-        # --- 预先在 __init__ 中创建固定 Tensor ---
-        self.input_data_est_tensor = torch.zeros((1, self.est_input_array.size), dtype=torch.float32, device=self.device)
-        self.input_data_tensor = torch.zeros((1, self.input_array.size), dtype=torch.float32, device=self.device)
-
         # --- compute_action() 中 ---
         if self.est_model is not None:
             # 直接更新 tensor 的值，而不是每次新建
@@ -301,7 +297,12 @@ class Controller:
         self.input_data_tensor[0].copy_(torch.from_numpy(self.input_array).float())
 
         with torch.no_grad():
-            self.output_data = self.policy(self.input_data_tensor).squeeze(0)
+            self.output_data = (
+                self.policy(self.input_data_tensor)
+                .squeeze(0)
+                .cpu()
+                .numpy()
+            )
 
 
         # out = np.array([output_data[0][i].item() for i in range(output_data.size(1))])
@@ -345,9 +346,9 @@ class Controller:
         self.cmd[1] = self.remote_controller.get_walk_y_direction_speed()
         self.cmd[2] = self.remote_controller.get_walk_yaw_direction_speed()
 
-        if self.counter % 4 == 0:
-            self.compute_obervation()
-            self.compute_action()
+        # if self.counter % 4 == 0:
+        self.compute_obervation()
+        self.compute_action()
 
         self.action_last = self.output_data
 
