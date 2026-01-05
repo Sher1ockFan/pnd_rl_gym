@@ -1,5 +1,5 @@
 # Adam Lite 12DOF Real Robot Deployment Configuration
-control_dt: 0.0025
+control_dt: 0.01
 
 msg_type: "adam_lite"     # "adam_lite"
 imu_type: "pelvis"    # "torso" or "pelvis"
@@ -7,8 +7,8 @@ imu_type: "pelvis"    # "torso" or "pelvis"
 lowcmd_topic: "rt/lowcmd"
 lowstate_topic: "rt/lowstate"
 
-policy_path: "{LEGGED_GYM_ROOT_DIR}/deploy/adam_lite_walk_pt/policy_aug5.pt"
-estimatory_path: "{LEGGED_GYM_ROOT_DIR}/deploy/adam_lite_walk_pt/estimator_aug5.pt"
+policy_path: "{LEGGED_GYM_ROOT_DIR}/deploy/adam_lite_walk_pt/policy.pt"
+estimatory_path: "{LEGGED_GYM_ROOT_DIR}/deploy/adam_lite_walk_pt/estimator.pt"
 
 # Joint mapping (12 DOF for legs)
 # Joint order: hipPitch_L, hipRoll_L, hipYaw_L, kneePitch_L, anklePitch_L, ankleRoll_L,

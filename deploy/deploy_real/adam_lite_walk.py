@@ -281,44 +281,46 @@ class Controller:
 
     def compute_action(self):
         # Run estimator model
-        # 创建一个全0的input，大小与self.est_input_array相同
-        input_data_est = torch.zeros(self.est_input_array.shape, dtype=torch.float32).unsqueeze(0)
+        # --- 预先在 __init__ 中创建固定 Tensor ---
+        self.input_data_est_tensor = torch.zeros((1, self.est_input_array.size), dtype=torch.float32, device=self.device)
+        self.input_data_tensor = torch.zeros((1, self.input_array.size), dtype=torch.float32, device=self.device)
 
+        # --- compute_action() 中 ---
         if self.est_model is not None:
-            input_data_est = torch.from_numpy(self.est_input_array).float().unsqueeze(0)
+            # 直接更新 tensor 的值，而不是每次新建
+            self.input_data_est_tensor[0].copy_(torch.from_numpy(self.est_input_array).float())
 
-            # with torch.no_grad():
-            output_data_est = self.est_model(input_data_est)
+            with torch.no_grad():
+                output_data_est = self.est_model(self.input_data_est_tensor)
 
             # Append latent to input_array
-            for i in range(self.config.latent_size):
-                self.input_array[self.est_input_num + i] = output_data_est[0][i].item()
-                
-        # Run policy network
-        input_data = torch.zeros(self.input_array.shape, dtype=torch.float32).unsqueeze(0)
-        input_data = torch.from_numpy(self.input_array).float().unsqueeze(0)
+        self.input_array[self.est_input_num : self.est_input_num + self.config.latent_size] = output_data_est[0, :self.config.latent_size].cpu().numpy()
 
-        # with torch.no_grad():
-        output_data = self.policy(input_data)
+        # --- policy 推理 ---
+        self.input_data_tensor[0].copy_(torch.from_numpy(self.input_array).float())
 
-        out = np.array([output_data[0][i].item() for i in range(output_data.size(1))])
-        # Process output
-        kObsDof = self.config.num_actions
-        for i in range(kObsDof):
-            # Compute action smoothing parameters for Walk gait (after processing all joints)
-            if self.gait_a == "Walk":
-                self.output_data_mlp[i] = np.clip(out[i], -18.0, 18.0)
-                self.para_0 = self.last_action_d
-                self.para_1 = self.last_action_dot_d
-                self.para_2 = 3.0 * (self.output_data_mlp - self.last_action_d - self.last_action_dot_d * self.predictive_time) / \
-                            self.predictive_time / self.predictive_time - \
-                            (-self.last_action_dot_d) / self.predictive_time
+        with torch.no_grad():
+            self.output_data = self.policy(self.input_data_tensor).squeeze(0)
 
-                self.para_3 = -2.0 * (self.output_data_mlp - self.last_action_d -
-                                    self.last_action_dot_d * self.predictive_time) / \
-                            self.predictive_time / self.predictive_time / self.predictive_time + \
-                            (-self.last_action_dot_d) / self.predictive_time / self.predictive_time
-                self.timer_plan = 0.0
+
+        # out = np.array([output_data[0][i].item() for i in range(output_data.size(1))])
+        # # Process output
+        # kObsDof = self.config.num_actions
+        # for i in range(kObsDof):
+        # #     # Compute action smoothing parameters for Walk gait (after processing all joints)
+        # #     if self.gait_a == "Walk":
+        #     self.output_data_mlp[i] = np.clip(out[i], -18.0, 18.0)
+        # #         self.para_0 = self.last_action_d
+        # #         self.para_1 = self.last_action_dot_d
+        # #         self.para_2 = 3.0 * (self.output_data_mlp - self.last_action_d - self.last_action_dot_d * self.predictive_time) / \
+        # #                     self.predictive_time / self.predictive_time - \
+        # #                     (-self.last_action_dot_d) / self.predictive_time
+
+        # #         self.para_3 = -2.0 * (self.output_data_mlp - self.last_action_d -
+        # #                             self.last_action_dot_d * self.predictive_time) / \
+        # #                     self.predictive_time / self.predictive_time / self.predictive_time + \
+        # #                     (-self.last_action_dot_d) / self.predictive_time / self.predictive_time
+        # #         self.timer_plan = 0.0
 
         self.rl_counter += self.phase_counter
             
@@ -346,25 +348,25 @@ class Controller:
             self.compute_obervation()
             self.compute_action()
 
-        self.action_last = self.output_data_mlp
+        self.action_last = self.output_data
 
-        self.timer_plan += self.config.control_dt
-        t = self.timer_plan
+        # self.timer_plan += self.config.control_dt
+        # t = self.timer_plan
 
-        mlp_out = (
-            self.para_0
-            + self.para_1 * t
-            + self.para_2 * t * t
-            + self.para_3 * t * t * t
-        )
+        # mlp_out = (
+        #     self.para_0
+        #     + self.para_1 * t
+        #     + self.para_2 * t * t
+        #     + self.para_3 * t * t * t
+        # )
 
-        mlp_out_dot = (
-            self.para_1
-            + 2.0 * self.para_2 * t
-            + 3.0 * self.para_3 * t * t
-        )
+        # mlp_out_dot = (
+        #     self.para_1
+        #     + 2.0 * self.para_2 * t
+        #     + 3.0 * self.para_3 * t * t
+        # )
 
-        self.mlp_out_scaled = mlp_out * self.action_scales + self.config.default_angles
+        self.mlp_out_scaled = self.output_data * self.action_scales + self.config.default_angles
         self.mlp_out_scaled[5]  = self.low_state.motor_state[5].q
         self.mlp_out_scaled[11] = self.low_state.motor_state[11].q
 
@@ -377,8 +379,8 @@ class Controller:
 
         self.send_cmd(self.low_cmd)
 
-        self.last_action_d = mlp_out
-        self.last_action_dot_d = mlp_out_dot
+        # self.last_action_d = self.output_data_mlp
+        # self.last_action_dot_d = mlp_out_dot
         self.counter += 1
 
         # ======================
@@ -391,9 +393,9 @@ class Controller:
 
         if sleep_ns > 0:
             time.sleep(sleep_ns / 1e9)
-        else:
-            # overrun: reset anchor to avoid accumulating delay
-            self.next_tick_ns = now_ns + self.control_dt_ns
+        # else:
+        #     # overrun: reset anchor to avoid accumulating delay
+        #     self.next_tick_ns = now_ns + self.control_dt_ns
 
         # optional debug
         # print(f"tick: {(time.perf_counter_ns() - start_ns)/1e6:.3f} ms")
