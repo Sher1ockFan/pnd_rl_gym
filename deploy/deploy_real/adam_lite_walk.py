@@ -215,12 +215,15 @@ class Controller:
                 for i in range(12):
                     self.hand_cmd.position[i] = self.close_hand[i]
                 self.hand_pub.Write(self.hand_cmd)
-            
+            self.compute_obervation()
+            self.compute_action()
+            # print("wu:")
             # create observation
             self.send_cmd(self.low_cmd)
             time.sleep(self.config.control_dt)
 
     def compute_obervation(self):
+        self.obs_start_time = time.time()
         """Compute observations similar to C++ StateMLP::computeObs"""
         # Get joint positions and velocities
                 # Fill leg joints
@@ -263,9 +266,9 @@ class Controller:
         
 
         # Apply low pass filter to angular velocity
-        omega_segment = self.input_data_mlp_humanoid[6+self.config.num_actions*3:6+self.config.num_actions*3+3]
-        filtered_omega = self.omega_filter.update(omega_segment)
-        self.input_data_mlp_humanoid[6+self.config.num_actions*3:6+self.config.num_actions*3+3] = filtered_omega
+        # omega_segment = self.input_data_mlp_humanoid[6+self.config.num_actions*3:6+self.config.num_actions*3+3]
+        # filtered_omega = self.omega_filter.update(omega_segment)
+        # self.input_data_mlp_humanoid[6+self.config.num_actions*3:6+self.config.num_actions*3+3] = filtered_omega
         
         # Clip observation
         self.input_data_mlp_humanoid = np.clip(self.input_data_mlp_humanoid, -18.0, 18.0)
@@ -279,23 +282,33 @@ class Controller:
         self.hist_obs[:-num_obs] = self.hist_obs[num_obs:]
         self.hist_obs[-num_obs:] = self.input_data_mlp_humanoid[:num_obs]
         self.input_array[:self.est_input_num] = self.hist_obs
+        self.obs_end_time = time.time()
 
     def compute_action(self):
+        self.action_start_time = time.time()
         # Run estimator model
         # --- compute_action() 中 ---
         if self.est_model is not None:
             # 直接更新 tensor 的值，而不是每次新建
+            self.cp_est_time_start = time.time()
             self.input_data_est_tensor[0].copy_(torch.from_numpy(self.est_input_array).float())
+            self.cp_est_time_end = time.time()
 
+            self.est_infer_time_start = time.time()
             with torch.no_grad():
                 output_data_est = self.est_model(self.input_data_est_tensor)
+            self.est_infer_time_end = time.time()
 
             # Append latent to input_array
         self.input_array[self.est_input_num : self.est_input_num + self.config.latent_size] = output_data_est[0, :self.config.latent_size].cpu().numpy()
 
         # --- policy 推理 ---
-        self.input_data_tensor[0].copy_(torch.from_numpy(self.input_array).float())
+        self.cp_policy_time_start = time.time()
 
+        self.input_data_tensor[0].copy_(torch.from_numpy(self.input_array).float())
+        self.cp_policy_time_end = time.time()
+
+        self.policy_infer_time_start = time.time()
         with torch.no_grad():
             self.output_data = (
                 self.policy(self.input_data_tensor)
@@ -304,6 +317,7 @@ class Controller:
                 .numpy()
             )
 
+            self.policy_infer_time_end = time.time()
 
         # out = np.array([output_data[0][i].item() for i in range(output_data.size(1))])
         # # Process output
@@ -325,14 +339,10 @@ class Controller:
         # #         self.timer_plan = 0.0
 
         self.rl_counter += self.phase_counter
-            
+        self.action_end_time = time.time()
     def run(self):
         # ---------- init tick anchor ----------
-        now_ns = time.perf_counter_ns()
-        if self.next_tick_ns is None:
-            self.next_tick_ns = now_ns + self.control_dt_ns
-
-        start_ns = now_ns
+        run_start = time.time()
 
         # ======================
         # your original logic
@@ -351,7 +361,6 @@ class Controller:
         self.compute_action()
 
         self.action_last = self.output_data
-
         # self.timer_plan += self.config.control_dt
         # t = self.timer_plan
 
@@ -369,8 +378,10 @@ class Controller:
         # )
 
         self.mlp_out_scaled = self.output_data * self.action_scales + self.config.default_angles
-        self.mlp_out_scaled[5]  = self.low_state.motor_state[5].q
-        self.mlp_out_scaled[11] = self.low_state.motor_state[11].q
+
+
+        # self.mlp_out_scaled[5]  = self.low_state.motor_state[5].q
+        # self.mlp_out_scaled[11] = self.low_state.motor_state[11].q
 
         for i in range(self.config.num_actions):
             self.low_cmd.motor_cmd[i].q = float(self.mlp_out_scaled[i])
@@ -388,20 +399,22 @@ class Controller:
         # ======================
         # precise timing control (align to absolute schedule)
         # ======================
-        self.next_tick_ns += self.control_dt_ns
-
-        now_ns = time.perf_counter_ns()
-        sleep_ns = self.next_tick_ns - now_ns
-
-        if sleep_ns > 0:
-            time.sleep(sleep_ns / 1e9)
+        time_until_next_step = self.config.control_dt - (time.time() - run_start)
+        if time_until_next_step > 0:
+            time.sleep(time_until_next_step)
+        else:
+            print("cp_est_time", (self.cp_est_time_end - self.cp_est_time_start))
+            print("cp_policy_time", (self.cp_policy_time_end - self.cp_policy_time_start))
+            print("est_infer_time", (self.est_infer_time_end - self.est_infer_time_start))
+            print("policy_infer_time", (self.policy_infer_time_end - self.policy_infer_time_start))
+            # print("action_time", (self.action_end_time - self.action_start_time))
+            # print(time.time() - run_start)
         # else:
         #     # overrun: reset anchor to avoid accumulating delay
         #     self.next_tick_ns = now_ns + self.control_dt_ns
 
         # optional debug
-        # print(f"tick: {(time.perf_counter_ns() - start_ns)/1e6:.3f} ms")
-        
+
 
 if __name__ == "__main__":
     import argparse
@@ -438,6 +451,6 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             break
     # Enter the damping state
-    create_damping_cmd(controller.low_cmd)
-    controller.send_cmd(controller.low_cmd)
+    # create_damping_cmd(controller.low_cmd)
+    # controller.send_cmd(controller.low_cmd)
     print("Exit")
