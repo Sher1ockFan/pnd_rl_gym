@@ -45,6 +45,14 @@ class Config:
             self.num_actions = config["num_actions"]
             self.num_obs = config["num_obs"]
 
+            self.history_length = config.get("history_length", 1)
+
+            _ids_map = config.get("joint_ids_map", None)
+            if _ids_map is not None:
+                self.joint_ids_map = np.array(_ids_map, dtype=np.int32)
+            else:
+                self.joint_ids_map = np.arange(self.num_actions, dtype=np.int32)
+
             # Optional parameters for advanced configurations
             self.delta_num = None
             if "delta_num" in config:

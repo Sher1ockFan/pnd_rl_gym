@@ -33,10 +33,10 @@ class Controller:
             self.est_model = torch.jit.load(config.estimatory_path, map_location="cpu")
         
         # Observation dimensions
-        self.num_obs = config.num_obs
-        self.input_num = config.num_obs * config.frame_stack + config.latent_size
-        self.est_input_num = config.num_obs * config.latent_frame_stack
-        self.delta_num = 0
+        self.delta_num = config.delta_num
+        self.num_obs = config.num_obs + self.delta_num
+        self.input_num = self.num_obs * config.frame_stack + config.latent_size
+        self.est_input_num = self.num_obs * config.latent_frame_stack
         
         # Initialize observation buffers
         self.hist_obs = np.zeros(self.est_input_num, dtype=np.float32)
@@ -134,7 +134,8 @@ class Controller:
         self.lowcmd_publisher_.Write(cmd)
 
     def wait_for_low_state(self):
-        while self.low_state.tick != 0:
+        while self.low_state.tick == 0:
+            print("Waiting for low state...")
             time.sleep(self.config.control_dt)
         print("Successfully connected to the robot.")
 
@@ -215,15 +216,12 @@ class Controller:
                 for i in range(12):
                     self.hand_cmd.position[i] = self.close_hand[i]
                 self.hand_pub.Write(self.hand_cmd)
-            self.compute_obervation()
-            self.compute_action()
-            # print("wu:")
+            
             # create observation
             self.send_cmd(self.low_cmd)
             time.sleep(self.config.control_dt)
 
     def compute_obervation(self):
-        self.obs_start_time = time.time()
         """Compute observations similar to C++ StateMLP::computeObs"""
         # Get joint positions and velocities
                 # Fill leg joints
@@ -258,11 +256,11 @@ class Controller:
         self.input_data_mlp_humanoid[3:6] = self.gravity_orientation
         self.input_data_mlp_humanoid[6:6+self.config.num_actions] = (self.cur_joint_pos - self.config.default_angles) * self.obs_scales_dof_pos
         self.input_data_mlp_humanoid[6+self.config.num_actions:6+self.config.num_actions*2] = self.cur_joint_vel * self.obs_scales_dof_vel
-        self.input_data_mlp_humanoid[6+self.config.num_actions*2:6+self.config.num_actions*3] = self.action_last
-        self.input_data_mlp_humanoid[6+self.config.num_actions*3:9+self.config.num_actions*3] = self.ang_vel * self.obs_scales_ang_vel
-        self.input_data_mlp_humanoid[9+self.config.num_actions*3] = self.avg_yaw_vel * self.obs_scales_ang_vel
-        self.input_data_mlp_humanoid[10+self.config.num_actions*3] = self.sin_phase
-        self.input_data_mlp_humanoid[11+self.config.num_actions*3] = self.cos_phase
+        self.input_data_mlp_humanoid[6+self.config.num_actions*2:6+self.config.num_actions*3 + self.delta_num] = self.action_last
+        self.input_data_mlp_humanoid[6+self.config.num_actions*3 + self.delta_num :9+self.config.num_actions*3 + self.delta_num] = self.ang_vel * self.obs_scales_ang_vel
+        self.input_data_mlp_humanoid[9+self.config.num_actions*3 + self.delta_num] = self.avg_yaw_vel * self.obs_scales_ang_vel
+        self.input_data_mlp_humanoid[10+self.config.num_actions*3 + self.delta_num] = self.sin_phase
+        self.input_data_mlp_humanoid[11+self.config.num_actions*3 + self.delta_num] = self.cos_phase
         
 
         # Apply low pass filter to angular velocity
@@ -282,33 +280,23 @@ class Controller:
         self.hist_obs[:-num_obs] = self.hist_obs[num_obs:]
         self.hist_obs[-num_obs:] = self.input_data_mlp_humanoid[:num_obs]
         self.input_array[:self.est_input_num] = self.hist_obs
-        self.obs_end_time = time.time()
 
     def compute_action(self):
-        self.action_start_time = time.time()
         # Run estimator model
         # --- compute_action() 中 ---
         if self.est_model is not None:
             # 直接更新 tensor 的值，而不是每次新建
-            self.cp_est_time_start = time.time()
             self.input_data_est_tensor[0].copy_(torch.from_numpy(self.est_input_array).float())
-            self.cp_est_time_end = time.time()
 
-            self.est_infer_time_start = time.time()
             with torch.no_grad():
                 output_data_est = self.est_model(self.input_data_est_tensor)
-            self.est_infer_time_end = time.time()
 
             # Append latent to input_array
         self.input_array[self.est_input_num : self.est_input_num + self.config.latent_size] = output_data_est[0, :self.config.latent_size].cpu().numpy()
 
         # --- policy 推理 ---
-        self.cp_policy_time_start = time.time()
-
         self.input_data_tensor[0].copy_(torch.from_numpy(self.input_array).float())
-        self.cp_policy_time_end = time.time()
 
-        self.policy_infer_time_start = time.time()
         with torch.no_grad():
             self.output_data = (
                 self.policy(self.input_data_tensor)
@@ -317,32 +305,36 @@ class Controller:
                 .numpy()
             )
 
-            self.policy_infer_time_end = time.time()
 
-        # out = np.array([output_data[0][i].item() for i in range(output_data.size(1))])
-        # # Process output
-        # kObsDof = self.config.num_actions
-        # for i in range(kObsDof):
-        # #     # Compute action smoothing parameters for Walk gait (after processing all joints)
-        # #     if self.gait_a == "Walk":
-        #     self.output_data_mlp[i] = np.clip(out[i], -18.0, 18.0)
-        # #         self.para_0 = self.last_action_d
-        # #         self.para_1 = self.last_action_dot_d
-        # #         self.para_2 = 3.0 * (self.output_data_mlp - self.last_action_d - self.last_action_dot_d * self.predictive_time) / \
-        # #                     self.predictive_time / self.predictive_time - \
-        # #                     (-self.last_action_dot_d) / self.predictive_time
+        self.out = self.output_data.copy()
 
-        # #         self.para_3 = -2.0 * (self.output_data_mlp - self.last_action_d -
-        # #                             self.last_action_dot_d * self.predictive_time) / \
-        # #                     self.predictive_time / self.predictive_time / self.predictive_time + \
-        # #                     (-self.last_action_dot_d) / self.predictive_time / self.predictive_time
-        # #         self.timer_plan = 0.0
+        # Process output
+        kObsDof = self.config.num_actions
+        for i in range(kObsDof):
+        #     # Compute action smoothing parameters for Walk gait (after processing all joints)
+            if self.gait_a == "Walk":
+                self.output_data_mlp[i] = np.clip(self.out[i], -18.0, 18.0)
+                self.para_0 = self.last_action_d
+                self.para_1 = self.last_action_dot_d
+                self.para_2 = 3.0 * (self.output_data_mlp - self.last_action_d - self.last_action_dot_d * self.predictive_time) / \
+                            self.predictive_time / self.predictive_time - \
+                            (-self.last_action_dot_d) / self.predictive_time
+
+                self.para_3 = -2.0 * (self.output_data_mlp - self.last_action_d -
+                                    self.last_action_dot_d * self.predictive_time) / \
+                            self.predictive_time / self.predictive_time / self.predictive_time + \
+                            (-self.last_action_dot_d) / self.predictive_time / self.predictive_time
+                self.timer_plan = 0.0
 
         self.rl_counter += self.phase_counter
-        self.action_end_time = time.time()
+            
     def run(self):
         # ---------- init tick anchor ----------
-        run_start = time.time()
+        now_ns = time.perf_counter_ns()
+        if self.next_tick_ns is None:
+            self.next_tick_ns = now_ns + self.control_dt_ns
+
+        start_ns = now_ns
 
         # ======================
         # your original logic
@@ -355,66 +347,65 @@ class Controller:
         self.cmd[0] = self.remote_controller.get_walk_x_direction_speed()
         self.cmd[1] = self.remote_controller.get_walk_y_direction_speed()
         self.cmd[2] = self.remote_controller.get_walk_yaw_direction_speed()
+        self.counter += 1
 
-        # if self.counter % 4 == 0:
-        self.compute_obervation()
-        self.compute_action()
+        if self.counter % 5 == 0:
+            self.compute_obervation()
+            self.compute_action()
 
-        self.action_last = self.output_data
-        # self.timer_plan += self.config.control_dt
-        # t = self.timer_plan
+        self.action_last = self.output_data_mlp
 
-        # mlp_out = (
-        #     self.para_0
-        #     + self.para_1 * t
-        #     + self.para_2 * t * t
-        #     + self.para_3 * t * t * t
-        # )
+        self.timer_plan += self.config.control_dt
+        t = self.timer_plan
 
-        # mlp_out_dot = (
-        #     self.para_1
-        #     + 2.0 * self.para_2 * t
-        #     + 3.0 * self.para_3 * t * t
-        # )
+        self.mlp_out = (
+            self.para_0
+            + self.para_1 * t
+            + self.para_2 * t * t
+            + self.para_3 * t * t * t
+        )
 
-        self.mlp_out_scaled = self.output_data * self.action_scales + self.config.default_angles
+        mlp_out_dot = (
+            self.para_1
+            + 2.0 * self.para_2 * t
+            + 3.0 * self.para_3 * t * t
+        )
 
-
+        self.mlp_out_scaled = self.output_data_mlp[0:23] * self.action_scales + self.config.default_angles
+        mlp_out_vel = self.output_data_mlp[23:35] * self.action_scales
+        mlp_out_vel = np.concatenate([np.zeros(11), mlp_out_vel])
         # self.mlp_out_scaled[5]  = self.low_state.motor_state[5].q
         # self.mlp_out_scaled[11] = self.low_state.motor_state[11].q
 
         for i in range(self.config.num_actions):
-            self.low_cmd.motor_cmd[i].q = float(self.mlp_out_scaled[i])
-            self.low_cmd.motor_cmd[i].qd = 0.0
-            self.low_cmd.motor_cmd[i].kp = float(self.config.kps[i])
-            self.low_cmd.motor_cmd[i].kd = float(self.config.kds[i])
+            self.low_cmd.motor_cmd[i].q = self.mlp_out_scaled[i]
+            self.low_cmd.motor_cmd[i].qd = mlp_out_vel[i]
+            self.low_cmd.motor_cmd[i].kp = self.config.kps[i]
+            self.low_cmd.motor_cmd[i].kd = self.config.kds[i]
             self.low_cmd.motor_cmd[i].tau = 0.0
 
         self.send_cmd(self.low_cmd)
 
         # self.last_action_d = self.output_data_mlp
-        # self.last_action_dot_d = mlp_out_dot
-        self.counter += 1
+        self.last_action_dot_d = mlp_out_dot
 
         # ======================
         # precise timing control (align to absolute schedule)
         # ======================
-        time_until_next_step = self.config.control_dt - (time.time() - run_start)
-        if time_until_next_step > 0:
-            time.sleep(time_until_next_step)
-        else:
-            print("cp_est_time", (self.cp_est_time_end - self.cp_est_time_start))
-            print("cp_policy_time", (self.cp_policy_time_end - self.cp_policy_time_start))
-            print("est_infer_time", (self.est_infer_time_end - self.est_infer_time_start))
-            print("policy_infer_time", (self.policy_infer_time_end - self.policy_infer_time_start))
-            # print("action_time", (self.action_end_time - self.action_start_time))
-            # print(time.time() - run_start)
+        self.next_tick_ns += self.control_dt_ns
+
+        now_ns = time.perf_counter_ns()
+        sleep_ns = self.next_tick_ns - now_ns
+
+        if sleep_ns > 0:
+            time.sleep(sleep_ns / 1e9)
         # else:
         #     # overrun: reset anchor to avoid accumulating delay
         #     self.next_tick_ns = now_ns + self.control_dt_ns
 
         # optional debug
-
+        # print(f"tick: {(time.perf_counter_ns() - start_ns)/1e6:.3f} ms")
+        
 
 if __name__ == "__main__":
     import argparse
@@ -451,6 +442,6 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             break
     # Enter the damping state
-    # create_damping_cmd(controller.low_cmd)
-    # controller.send_cmd(controller.low_cmd)
+    create_damping_cmd(controller.low_cmd)
+    controller.send_cmd(controller.low_cmd)
     print("Exit")

@@ -4,8 +4,19 @@ import mujoco.viewer
 import mujoco
 import numpy as np
 from legged_gym import LEGGED_GYM_ROOT_DIR
-import torch
 import yaml
+import collections
+import math
+
+try:
+    import onnxruntime as ort
+except ImportError:
+    ort = None
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 
 def get_gravity_orientation(quaternion):
@@ -26,6 +37,45 @@ def get_gravity_orientation(quaternion):
 def pd_control(target_q, q, kp, target_dq, dq, kd):
     """Calculates torques from position commands"""
     return (target_q - q) * kp + (target_dq - dq) * kd
+
+
+class ObsBuffer:
+    """Ring buffer that keeps *history_length* frames for one observation term."""
+    def __init__(self, dim, history_length=1):
+        self.dim = dim
+        self.history_length = history_length
+        self._buf = collections.deque(maxlen=history_length)
+        self.reset()
+
+    def reset(self):
+        self._buf.clear()
+        for _ in range(self.history_length):
+            self._buf.append(np.zeros(self.dim, dtype=np.float32))
+
+    def push(self, obs):
+        self._buf.append(obs.astype(np.float32))
+
+    def flat(self):
+        return np.concatenate(list(self._buf))
+
+
+def load_policy(path):
+    if path.endswith(".onnx"):
+        assert ort is not None, "onnxruntime is required for .onnx policy"
+        sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        in_name = sess.get_inputs()[0].name
+        out_name = sess.get_outputs()[0].name
+        def _infer(obs_np):
+            return sess.run([out_name], {in_name: obs_np.reshape(1, -1).astype(np.float32)})[0].squeeze()
+        return _infer
+    else:
+        assert torch is not None, "torch is required for .pt/.jit policy"
+        model = torch.jit.load(path, map_location="cpu")
+        model.eval()
+        def _infer(obs_np):
+            with torch.no_grad():
+                return model(torch.from_numpy(obs_np).unsqueeze(0).float()).squeeze().numpy()
+        return _infer
 
 
 if __name__ == "__main__":
@@ -58,13 +108,49 @@ if __name__ == "__main__":
 
         num_actions = config["num_actions"]
         num_obs = config["num_obs"]
-        
+
         cmd = np.array(config["cmd_init"], dtype=np.float32)
+
+    # ---- auto-detect history_length & gait_phase from num_obs ----
+    gait_period = config.get("gait_period", 0.8)
+    base_no_phase = 3 * num_actions + 9
+    base_with_phase = base_no_phase + 2
+
+    history_length = 1
+    use_gait_phase = False
+
+    if num_obs % base_with_phase == 0:
+        use_gait_phase = True
+        history_length = num_obs // base_with_phase
+    elif num_obs % base_no_phase == 0:
+        use_gait_phase = False
+        history_length = num_obs // base_no_phase
+    else:
+        raise ValueError(
+            f"num_obs={num_obs} cannot be decomposed with num_actions={num_actions}. "
+            f"Expected multiple of {base_no_phase} or {base_with_phase}."
+        )
+
+    # ---- build observation history buffers ----
+    buf_ang_vel = ObsBuffer(3, history_length)
+    buf_gravity = ObsBuffer(3, history_length)
+    buf_cmd     = ObsBuffer(3, history_length)
+    buf_pos     = ObsBuffer(num_actions, history_length)
+    buf_vel     = ObsBuffer(num_actions, history_length)
+    buf_action  = ObsBuffer(num_actions, history_length)
+    obs_buffers = [buf_ang_vel, buf_gravity, buf_cmd, buf_pos, buf_vel, buf_action]
+
+    if use_gait_phase:
+        buf_phase = ObsBuffer(2, history_length)
+        obs_buffers.append(buf_phase)
+
+    total_obs = sum(b.dim * b.history_length for b in obs_buffers)
+    assert total_obs == num_obs, f"obs mismatch: computed {total_obs} != config {num_obs}"
+    print(f"[deploy] obs_dim={total_obs}  history={history_length}  gait_phase={use_gait_phase}")
 
     # define context variables
     action = np.zeros(num_actions, dtype=np.float32)
     target_dof_pos = default_angles.copy()
-    obs = np.zeros(num_obs, dtype=np.float32)
 
     counter = 0
 
@@ -74,7 +160,7 @@ if __name__ == "__main__":
     m.opt.timestep = simulation_dt
 
     # load policy
-    policy = torch.jit.load(policy_path)
+    policy = load_policy(policy_path)
 
     with mujoco.viewer.launch_passive(m, d) as viewer:
         # Close the viewer automatically after simulation_duration wall-seconds.
@@ -98,27 +184,25 @@ if __name__ == "__main__":
                 quat = d.qpos[3:7]
                 omega = d.qvel[3:6]
 
-                qj = (qj - default_angles) * dof_pos_scale
-                dqj = dqj * dof_vel_scale
-                gravity_orientation = get_gravity_orientation(quat)
-                omega = omega * ang_vel_scale
+                # push into history buffers (scaled)
+                buf_ang_vel.push(omega * ang_vel_scale)
+                buf_gravity.push(get_gravity_orientation(quat))
+                buf_cmd.push(cmd * cmd_scale)
+                buf_pos.push((qj - default_angles) * dof_pos_scale)
+                buf_vel.push(dqj * dof_vel_scale)
+                buf_action.push(action)
 
-                period = 0.8
-                count = counter * simulation_dt
-                phase = count % period / period
-                sin_phase = np.sin(2 * np.pi * phase)
-                cos_phase = np.cos(2 * np.pi * phase)
+                if use_gait_phase:
+                    count = counter * simulation_dt
+                    phase = count % gait_period / gait_period
+                    sin_phase = np.sin(2 * np.pi * phase)
+                    cos_phase = np.cos(2 * np.pi * phase)
+                    buf_phase.push(np.array([sin_phase, cos_phase], dtype=np.float32))
 
-                obs[:3] = omega
-                obs[3:6] = gravity_orientation
-                obs[6:9] = cmd * cmd_scale
-                obs[9 : 9 + num_actions] = qj
-                obs[9 + num_actions : 9 + 2 * num_actions] = dqj
-                obs[9 + 2 * num_actions : 9 + 3 * num_actions] = action
-                obs[9 + 3 * num_actions : 9 + 3 * num_actions + 2] = np.array([sin_phase, cos_phase])
-                obs_tensor = torch.from_numpy(obs).unsqueeze(0)
+                obs = np.concatenate([b.flat() for b in obs_buffers])
+
                 # policy inference
-                action = policy(obs_tensor).detach().numpy().squeeze()
+                action = policy(obs)
                 # transform action to target_dof_pos
                 target_dof_pos = action * action_scale + default_angles
 
